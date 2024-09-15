@@ -1,273 +1,261 @@
+import os
+import random
+import numpy as np
+import logging
 import torch
+import torch.distributed as dist
+import torch.optim as optim
 import torch.nn as nn
-import torch.nn.functional as F
-import geoopt
-from geoopt import ManifoldParameter
-import math
-
-# Hyperbolic Layer Normalization
-class HyperbolicLayerNorm(nn.Module):
-    def __init__(self, embedding_dim, manifold, eps=1e-5):
-        super(HyperbolicLayerNorm, self).__init__()
-        self.manifold = manifold
-        self.eps = eps
-        self.normalized_shape = (embedding_dim,)  # Normalize over embedding_dim only
-        self.gamma = nn.Parameter(torch.ones(embedding_dim))
-        self.beta = nn.Parameter(torch.zeros(embedding_dim))
-
-    def forward(self, x):
-        # Map to tangent space at origin
-        x_tangent = self.manifold.logmap0(x)
-        # Apply LayerNorm over the last dimension (embedding_dim)
-        x_norm = F.layer_norm(
-            x_tangent, 
-            self.normalized_shape, 
-            self.gamma, 
-            self.beta, 
-            self.eps
-        )
-        # Map back to manifold
-        return self.manifold.expmap0(x_norm)
-
-# Parametric ReLU in Hyperbolic Space with Shared Alpha
-class MobiusPReLU(nn.Module):
-    def __init__(self, manifold):
-        super(MobiusPReLU, self).__init__()
-        self.manifold = manifold
-        # Initialize alpha as a single parameter shared across all channels
-        self.alpha = nn.Parameter(torch.ones(1))
+from torch.utils.tensorboard import SummaryWriter
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+from torchvision import datasets, transforms
+from tqdm import tqdm
+from torch.utils.data import DataLoader
+from model import Net
+from torch.cuda.amp import GradScaler
+from geoopt.optim import RiemannianAdam
+import torch.nn.utils
     
-    def forward(self, x):
-        # Map to tangent space at origin
-        x_euclidean = self.manifold.logmap0(x)
-        # Apply PReLU with shared alpha
-        x_relu = F.prelu(x_euclidean, self.alpha)
-        # Map back to manifold
-        return self.manifold.expmap0(x_relu)
+# Set up logger
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
-# Hyperbolic Linear Layer with He Initialization
-class HyperbolicLinear(nn.Module):
-    def __init__(self, in_features, out_features, manifold, bias=True):
-        super(HyperbolicLinear, self).__init__()
-        self.manifold = manifold
-        self.in_features = in_features
-        self.out_features = out_features
+# Set random seed for reproducibility
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
-        self.weight = ManifoldParameter(
-            torch.Tensor(out_features, in_features), manifold=manifold
-        )
-        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))  # He Initialization
-        if bias:
-            self.bias = ManifoldParameter(
-                torch.zeros(out_features), manifold=manifold
-            )
-            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
-            bound = 1 / math.sqrt(fan_in)
-            nn.init.uniform_(self.bias, -bound, bound)
-        else:
-            self.bias = None
+# Function to save the model
+def save_model(output_dir, model, epoch):
+    model_to_save = model.module if hasattr(model, 'module') else model
+    model_checkpoint = os.path.join(output_dir, f"checkpoint_epoch_{epoch}.pth")
+    torch.save(model_to_save.state_dict(), model_checkpoint)
+    logger.info(f"Model checkpoint saved at {model_checkpoint}")
 
-    def forward(self, input):
-        original_shape = input.shape
-        in_features = input.shape[-1]
+# AverageMeter to track losses and accuracy
+class AverageMeter(object):
+    def __init__(self):
+        self.reset()
 
-        if in_features != self.in_features:
-            raise ValueError(
-                f"Incompatible shapes: input shape {input.size()} and weight shape {self.weight.size()}"
-            )
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
 
-        input_flat = input.reshape(-1, in_features)
-        output_flat = self.manifold.mobius_matvec(self.weight, input_flat)
-        output = output_flat.view(*original_shape[:-1], self.out_features)
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
 
-        if self.bias is not None:
-            bias_unsqueezed = self.bias.view(
-                *([1] * (output.dim() - 1)),
-                self.out_features
-            )
-            output = self.manifold.mobius_add(output, bias_unsqueezed)
+# Function to calculate accuracy
+def simple_accuracy(preds, labels):
+    return (preds == labels).mean() * 100
 
-        return output
+import numpy as np
 
-# Hyperbolic Learned Position Encoding
-class HyperbolicLearnedPositionEncoding(nn.Module):
-    def __init__(self, num_patches, embedding_dim, manifold):
-        super(HyperbolicLearnedPositionEncoding, self).__init__()
-        self.manifold = manifold
-        self.position_embeddings = ManifoldParameter(
-            torch.zeros(1, num_patches, embedding_dim), manifold=manifold
-        )
-        nn.init.xavier_uniform_(self.position_embeddings)
-        self.curvature = nn.Parameter(torch.tensor(1.0))  # Learnable curvature
+def top_5_accuracy(logits, targets):
+    """
+    Compute the top-5 accuracy for classification tasks using logits.
 
-    def forward(self, x):
-        scaled_embeddings = self.position_embeddings.mul(self.curvature)
-        return self.manifold.mobius_add(x, scaled_embeddings)
+    Parameters:
+    logits (numpy.ndarray): Array of shape (n_samples, n_classes) containing the logits (raw model outputs).
+    targets (numpy.ndarray): Array of shape (n_samples,) containing the true labels (as integer indices).
 
-# Hyperbolic Multihead Attention with DropConnect
-class HyperbolicMultiheadAttention(nn.Module):
-    def __init__(self, embedding_dim, num_heads, manifold, dropconnect_prob=0.1):
-        super(HyperbolicMultiheadAttention, self).__init__()
-        self.embedding_dim = embedding_dim
-        self.num_heads = num_heads
-        self.manifold = manifold
-        self.head_dim = embedding_dim // num_heads
+    Returns:
+    float: Top-5 accuracy score as a percentage.
+    """
+    # Ensure logits is a 2D array
+    if logits.ndim == 1:
+        logits = logits.reshape(-1, 1)
 
-        self.query_proj = HyperbolicLinear(embedding_dim, embedding_dim, manifold)
-        self.key_proj = HyperbolicLinear(embedding_dim, embedding_dim, manifold)
-        self.value_proj = HyperbolicLinear(embedding_dim, embedding_dim, manifold)
+    # Get the indices of the top 5 logits for each sample
+    top5_preds = np.argsort(logits, axis=1)[:, -5:]
+    
+    # Check if the true label is in the top 5 predictions for each sample
+    top5_correct = np.any(top5_preds == targets.reshape(-1, 1), axis=1)
+    
+    # Compute the top-5 accuracy
+    top5_accuracy = np.mean(top5_correct) * 100
+    
+    return top5_accuracy
 
-        self.out_proj = HyperbolicLinear(embedding_dim, embedding_dim, manifold)
 
-        self.head_scaling = nn.Parameter(torch.ones(num_heads, 1, 1))
-        self.curvature = manifold.c if hasattr(manifold, 'c') else 1.0
-        self.dropconnect_prob = dropconnect_prob
+# Geodesic regularization function
+def geodesic_regularization(outputs, labels, manifold, lambda_reg=0.01):
+    """
+    Compute the geodesic regularization loss based on the output embeddings.
+    
+    Args:
+        outputs (torch.Tensor): Output embeddings of shape (batch_size, embedding_dim).
+        labels (torch.Tensor): Ground truth labels of shape (batch_size,).
+        manifold (geoopt.Manifold): The manifold being used, e.g., PoincareBall.
+        lambda_reg (float): The regularization coefficient.
+    
+    Returns:
+        torch.Tensor: The geodesic regularization loss.
+    """
+    dist_matrix = manifold.dist(outputs.unsqueeze(1), outputs.unsqueeze(0))  # Pairwise geodesic distances
+    label_matrix = (labels.unsqueeze(1) == labels.unsqueeze(0)).float()  # 1 if labels are the same, else 0
+    reg_loss = ((1 - label_matrix) * dist_matrix).mean()  # Penalize distances between different-class points
+    return lambda_reg * reg_loss
 
-    def forward(self, x):
-        batch_size, seq_length, embed_dim = x.size()
 
-        q = self.query_proj(x).view(batch_size, seq_length, self.num_heads, self.head_dim)
-        k = self.key_proj(x).view(batch_size, seq_length, self.num_heads, self.head_dim)
-        v = self.value_proj(x).view(batch_size, seq_length, self.num_heads, self.head_dim)
+# Validation function
+def validate(model, val_loader, device):
+    eval_losses = AverageMeter()
+    criterion = nn.CrossEntropyLoss()
 
-        q, k, v = [tensor.transpose(1, 2) for tensor in (q, k, v)]  # (batch_size, num_heads, seq_length, head_dim)
+    logger.info("***** Running Validation *****")
+    model.eval()
+    all_preds, all_labels = [], []
+    with torch.no_grad():
+        for inputs, labels in tqdm(val_loader, desc="Validating"):
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            eval_losses.update(loss.item(), inputs.size(0))
 
-        q_norm = q.norm(dim=-1, keepdim=True).pow(2)
-        k_norm = k.norm(dim=-1, keepdim=True).pow(2)
-        denom = (1 - self.curvature * q_norm).unsqueeze(-2) * (1 - self.curvature * k_norm).unsqueeze(-3) + 1e-15
+            preds = torch.argmax(outputs, dim=-1)
+            all_preds.append(preds.cpu().numpy())
+            all_labels.append(labels.cpu().numpy())
 
-        diff = q.unsqueeze(-2) - k.unsqueeze(-3)
-        diff_norm_sq = diff.pow(2).sum(dim=-1)
+    all_preds = np.concatenate(all_preds, axis=0)
+    all_labels = np.concatenate(all_labels, axis=0)
+    accuracy = simple_accuracy(all_preds, all_labels)
+    top5 = top_5_accuracy(all_preds, all_labels)
+    logger.info(f"Validation Accuracy: {accuracy:.4f}%, Validation Loss: {eval_losses.avg:.4f}, Top-5 Accuracy: {top5:.4f}%")
+    return accuracy, top5
 
-        arccosh_arg = 1 + 2 * self.curvature * diff_norm_sq / denom.squeeze(-1)
-        arccosh_arg = arccosh_arg.clamp(min=1 + 1e-7)  # Stability
+# Training function
+def train_ddp(rank, world_size):
+    # Initialize the process group
+    dist.init_process_group(backend='nccl', init_method='env://', world_size=world_size, rank=rank)
+    torch.cuda.set_device(rank)
+    device = torch.device(f'cuda:{rank}')
 
-        dist = torch.log(arccosh_arg + torch.sqrt(arccosh_arg.pow(2) - 1))
-        attn_scores = -dist.pow(2) / (self.head_scaling * (self.head_dim ** 0.5))
+    set_seed(42)  # Set a fixed seed for reproducibility
 
-        attn_weights = F.softmax(attn_scores, dim=-1)
+    # Set hyperparameters
+    batch_size = 32
+    num_epochs = 350       
+    learning_rate = 0.01 / world_size 
+    output_dir = './output'
 
-        if self.training and self.dropconnect_prob > 0:
-            attn_weights = F.dropout(attn_weights, p=self.dropconnect_prob, training=True)
+    # Model setup
+    model = Net(num_classes=1000).to(device)  # ImageNet has 1000 classes
+    model = DDP(model, device_ids=[rank])
 
-        attn_output = torch.matmul(attn_weights, v)
-        attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_length, embed_dim)
-        output = self.out_proj(attn_output)
+    # Data augmentation and normalization for ImageNet
+    transform = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    
+    transform_cifar = transforms.Compose([
+        transforms.ToTensor()
+    ])
 
-        return output
+    train_dataset = datasets.ImageNet(root='/data/jacob/ImageNet/', split='train', transform=transform)
+    val_dataset = datasets.ImageNet(root='/data/jacob/ImageNet/', split='val', transform=transform)
 
-# Hyperbolic Transformer Layer with Enhancements
-class HyperbolicTransformerLayer(nn.Module):
-    def __init__(self, embedding_dim, num_heads, dropout, manifold):
-        super(HyperbolicTransformerLayer, self).__init__()
-        self.manifold = manifold
+    # train_dataset = datasets.CIFAR10(root='/data/jacob/cifar10/', train=True, download=True, transform=transform_cifar)
+    # val_dataset = datasets.CIFAR10(root='/data/jacob/cifar10/', train=False, download=True, transform=transform_cifar)
+    
+    # Sampler and DataLoader
+    train_sampler = DistributedSampler(train_dataset)
+    val_sampler = DistributedSampler(val_dataset, shuffle=False)
+    
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=train_sampler, num_workers=8, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, sampler=val_sampler, num_workers=8, pin_memory=True)
 
-        self.self_attn = HyperbolicMultiheadAttention(embedding_dim, num_heads, manifold)
-        self.norm1 = HyperbolicLayerNorm(embedding_dim, manifold)  # Corrected LayerNorm
-        self.norm2 = HyperbolicLayerNorm(embedding_dim, manifold)  # Corrected LayerNorm
+    # Loss, optimizer, and scheduler
+    criterion = nn.CrossEntropyLoss()
+    optimizer = RiemannianAdam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=80, gamma=0.1)  # Step LR, decay at epoch 30, 60
+
+    # Mixed Precision Scaler
+    scaler = GradScaler()
+
+    # Gradient clipping value
+    clip_value = 1.0  # Clip gradients to this value
+
+    # Regularization weight for geodesic loss
+    lambda_reg = 0.01  # Weight for the geodesic regularization
+
+    # TensorBoard writer (only for rank 0 process)
+    if rank == 0:
+        writer = SummaryWriter(log_dir=os.path.join(output_dir, 'logs'))
+    
+    file = open("log.txt", "w")
+    
+    # Training loop
+    for epoch in range(num_epochs):
+        model.train()
+        train_sampler.set_epoch(epoch)
+        running_loss = 0.0
+
+        for i, (inputs, labels) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")):
+            inputs, labels = inputs.to(device), labels.to(device)
+
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+
+            # Geodesic regularization term
+            reg_loss = geodesic_regularization(outputs, labels, model.module.manifold, lambda_reg=lambda_reg)
+            total_loss = loss + reg_loss
+
+            # Backward pass with gradient scaling for mixed precision
+            scaler.scale(total_loss).backward()
+
+            # Gradient clipping (after backward, before step)
+            scaler.unscale_(optimizer)  # Unscales gradients to prevent issues when clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_value)
+
+            # Update weights
+            scaler.step(optimizer)
+            scaler.update()
+
+            running_loss += total_loss.item()
+
+        logger.info(f"Epoch {epoch+1}, Loss: {running_loss / len(train_loader)}")
+
+        # Validation
+        accuracy, accuracy5 = validate(model, val_loader, device)
+
+        # TensorBoard writer
+        if rank == 0:
+            writer.add_scalar('Loss/train', running_loss / len(train_loader), epoch+1)
+            writer.add_scalar('Accuracy/val', accuracy, epoch+1)
+            logger.info(f"Epoch {epoch+1}, Loss: {running_loss / len(train_loader)}, Accuracy: {accuracy:.4f}, Top5: {accuracy5:.4f}")
+            file.write(f"Epoch {epoch+1}, Loss: {running_loss / len(train_loader)}, Accuracy: {accuracy:.4f}, Top5: {accuracy5:.4f}\n")
+            file.flush()
         
-        self.linear1 = HyperbolicLinear(embedding_dim, embedding_dim * 4, manifold)
-        self.activation = MobiusPReLU(manifold)  # Updated to use shared alpha
-        self.linear2 = HyperbolicLinear(embedding_dim * 4, embedding_dim, manifold)
-        self.dropout = nn.Dropout(dropout)
-        self.layer_scaling = nn.Parameter(torch.ones(1))
+        # Save checkpoint every 5 epochs
+        if (epoch + 1) % 5 == 0:
+            save_model(output_dir, model, epoch+1)
     
-    def forward(self, x):
-        # Self-attention with normalization
-        attn_output = self.self_attn(x)
-        x = self.norm1(self.manifold.mobius_add(x, self.dropout(attn_output).mul(self.layer_scaling)))
-    
-        # Feedforward network with Mobius PReLU and normalization
-        x2 = self.linear1(x)
-        x2 = self.activation(x2)  # Activation now correctly handles shape
-        x2 = self.linear2(x2)
-        x = self.norm2(self.manifold.mobius_add(x, self.dropout(x2).mul(self.layer_scaling)))
-    
-        return x
+        scheduler.step()
+ 
+    if rank == 0: 
+        writer.close()
 
-# Final Enhanced Network
-class Net(nn.Module):
-    # def __init__(self,
-    #              img_size=32,
-    #              patch_size=4,
-    #              in_channels=3,
-    #              num_classes=10,
-    #              embedding_dim=256,  # Increased from 128
-    #              num_heads=8,         # Increased from 4
-    #              num_layers=6,        # Increased from 4
-    #              dropout=0.1,
-    #              manifold=None):
-    def __init__(self,
-                    img_size=224,
-                    patch_size=16,
-                    in_channels=3,
-                    num_classes=1000,
-                    embedding_dim=768,
-                    num_heads=12,
-                    num_layers=12,
-                    dropout=0.1,
-                    manifold=None):
-        super(Net, self).__init__()
-        if manifold is None:
-            self.manifold = geoopt.PoincareBall(c=1.0)  # Use fixed curvature
-        else:
-            self.manifold = manifold
+    dist.destroy_process_group()
 
-        self.num_patches = (img_size // patch_size) ** 2
+# Main function
+def main():
+    world_size = torch.cuda.device_count()
+    rank = int(os.environ['RANK'])  # rank should be set by distributed launcher
+    train_ddp(rank, world_size)
 
-        self.patch_embeddings = nn.Conv2d(
-            in_channels,
-            embedding_dim,
-            kernel_size=patch_size,
-            stride=patch_size,
-        )
+if __name__ == "__main__":
+    main()
 
-        self.hyperbolic_embedding = HyperbolicLearnedPositionEncoding(
-            self.num_patches, embedding_dim, self.manifold
-        )
-
-        self.layers = nn.ModuleList([
-            HyperbolicTransformerLayer(embedding_dim, num_heads, dropout, self.manifold)
-            for _ in range(num_layers)
-        ])
-
-        self.norm = HyperbolicLayerNorm(embedding_dim, self.manifold)  # Corrected LayerNorm
-        self.dropout = nn.Dropout(dropout)
-        self.fc = HyperbolicLinear(embedding_dim, num_classes, self.manifold)
-
-    def forward(self, x):
-        x = self.patch_embeddings(x)  # (batch_size, embedding_dim, num_patches_sqrt, num_patches_sqrt)
-        x = x.flatten(2).transpose(1, 2)  # (batch_size, num_patches, embedding_dim)
-
-        x = self.manifold.expmap0(x)
-        x = self.hyperbolic_embedding(x)
-
-        for layer in self.layers:
-            x = layer(x)
-
-        x = self.norm(x)
-        x = self.manifold.logmap0(x)
-        x = x.mean(dim=1)
-
-        x = self.dropout(x)
-        x = self.fc(x)
-
-        return x
-
-    def get_features(self, x):
-        x = self.patch_embeddings(x)
-        x = x.flatten(2).transpose(1, 2)
-        x = self.manifold.expmap0(x)
-        x = self.hyperbolic_embedding(x)
-        for layer in self.layers:
-            x = layer(x)
-        x = self.norm(x)
-        return self.manifold.logmap0(x)
-
-    def geodesic_regularization(self, x, labels, margin=1.0):
-        dist_matrix = self.manifold.dist(x.unsqueeze(1), x.unsqueeze(0))
-        label_matrix = (labels.unsqueeze(1) == labels.unsqueeze(0)).float()
-        positive_dist = (label_matrix * dist_matrix).sum(dim=1) / (label_matrix.sum(dim=1) + 1e-15)
-        negative_dist = ((1 - label_matrix) * dist_matrix).min(dim=1)[0]
-        loss = F.relu(margin + positive_dist - negative_dist).mean()
-        return loss
