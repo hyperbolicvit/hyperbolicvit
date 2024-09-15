@@ -24,6 +24,13 @@ def load_checkpoint(checkpoint_path, model, device):
         print(f"No checkpoint found at '{checkpoint_path}'")
         exit()
 
+def get_num_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+def get_gflops(model, input_shape):
+    from thop import profile
+    input = torch.randn(*input_shape)
+    return profile(model, inputs=(input,))
 
 def test_model(checkpoint_path, batch_size=32):
     transform_cifar = transforms.Compose([
@@ -48,7 +55,15 @@ def test_model(checkpoint_path, batch_size=32):
 
     model = Net(num_classes=1000).to(device)
     load_checkpoint(checkpoint_path, model, device)
+    
+    # Print the number of parameters in the model
+    print(f"Number of parameters in the model: {get_num_parameters(model)}")
 
+    # Print the number of FLOPs
+    input_shape = (1, 3, 224, 224)
+    gflops, _ = get_gflops(model, input_shape)
+    print(f"GFLOPs: {gflops / 1e9:.2f}")
+    
     model.eval()
     criterion = nn.CrossEntropyLoss()
 
