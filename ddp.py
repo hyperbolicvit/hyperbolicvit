@@ -163,11 +163,11 @@ def train_ddp(rank, world_size):
         transforms.ToTensor()
     ])
 
-    # train_dataset = datasets.ImageNet(root='/data/jacob/ImageNet/', split='train', transform=transform)
-    # val_dataset = datasets.ImageNet(root='/data/jacob/ImageNet/', split='val', transform=transform)
+    train_dataset = datasets.ImageNet(root='/data/jacob/ImageNet/', split='train', transform=transform)
+    val_dataset = datasets.ImageNet(root='/data/jacob/ImageNet/', split='val', transform=transform)
 
-    train_dataset = datasets.CIFAR10(root='/data/jacob/cifar10/', train=True, download=True, transform=transform_cifar)
-    val_dataset = datasets.CIFAR10(root='/data/jacob/cifar10/', train=False, download=True, transform=transform_cifar)
+    # train_dataset = datasets.CIFAR10(root='/data/jacob/cifar10/', train=True, download=True, transform=transform_cifar)
+    # val_dataset = datasets.CIFAR10(root='/data/jacob/cifar10/', train=False, download=True, transform=transform_cifar)
     
     # Sampler and DataLoader
     train_sampler = DistributedSampler(train_dataset)
