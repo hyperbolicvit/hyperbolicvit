@@ -187,16 +187,26 @@ class HyperbolicTransformerLayer(nn.Module):
 
 # Final Enhanced Network
 class Net(nn.Module):
+    # def __init__(self,
+    #              img_size=32,
+    #              patch_size=4,
+    #              in_channels=3,
+    #              num_classes=10,
+    #              embedding_dim=256,  # Increased from 128
+    #              num_heads=8,         # Increased from 4
+    #              num_layers=6,        # Increased from 4
+    #              dropout=0.1,
+    #              manifold=None):
     def __init__(self,
-                 img_size=32,
-                 patch_size=4,
-                 in_channels=3,
-                 num_classes=10,
-                 embedding_dim=256,  # Increased from 128
-                 num_heads=8,         # Increased from 4
-                 num_layers=6,        # Increased from 4
-                 dropout=0.1,
-                 manifold=None):
+                    img_size=224,
+                    patch_size=16,
+                    in_channels=3,
+                    num_classes=1000,
+                    embedding_dim=768,
+                    num_heads=12,
+                    num_layers=12,
+                    dropout=0.1,
+                    manifold=None):
         super(Net, self).__init__()
         if manifold is None:
             self.manifold = geoopt.PoincareBall(c=1.0)  # Use fixed curvature
