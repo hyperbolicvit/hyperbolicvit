@@ -59,19 +59,31 @@ def simple_accuracy(preds, labels):
 
 import numpy as np
 
-def top_5_accuracy(preds, targets):
-    # Check if preds is 1D and reshape it accordingly
-    if preds.ndim == 1:
-        preds = preds.reshape(-1, 1)
+def top_5_accuracy(logits, targets):
+    """
+    Compute the top-5 accuracy for classification tasks using logits.
 
-    # Get the indices of the top 5 predictions for each sample
-    top5_preds = np.argsort(preds, axis=1)[:, -5:]
+    Parameters:
+    logits (numpy.ndarray): Array of shape (n_samples, n_classes) containing the logits (raw model outputs).
+    targets (numpy.ndarray): Array of shape (n_samples,) containing the true labels (as integer indices).
+
+    Returns:
+    float: Top-5 accuracy score as a percentage.
+    """
+    # Ensure logits is a 2D array
+    if logits.ndim == 1:
+        logits = logits.reshape(-1, 1)
+
+    # Get the indices of the top 5 logits for each sample
+    top5_preds = np.argsort(logits, axis=1)[:, -5:]
     
-    # Check if the true label is in the top 5 predictions
-    top5_correct = [1 if target in top5_preds[i] else 0 for i, target in enumerate(targets)]
+    # Check if the true label is in the top 5 predictions for each sample
+    top5_correct = np.any(top5_preds == targets.reshape(-1, 1), axis=1)
     
     # Compute the top-5 accuracy
-    return np.mean(top5_correct) * 100
+    top5_accuracy = np.mean(top5_correct) * 100
+    
+    return top5_accuracy
 
 
 # Geodesic regularization function
@@ -136,7 +148,7 @@ def train_ddp(rank, world_size):
     output_dir = './output'
 
     # Model setup
-    model = Net(num_classes=1000).to(device)  # ImageNet has 1000 classes
+    model = Net(num_classes=10).to(device)  # ImageNet has 1000 classes
     model = DDP(model, device_ids=[rank])
 
     # Data augmentation and normalization for ImageNet
@@ -182,7 +194,7 @@ def train_ddp(rank, world_size):
     if rank == 0:
         writer = SummaryWriter(log_dir=os.path.join(output_dir, 'logs'))
     
-    file = open("log.txt", "a")
+    file = open("log.txt", "w")
     
     # Training loop
     for epoch in range(num_epochs):
@@ -232,8 +244,8 @@ def train_ddp(rank, world_size):
             save_model(output_dir, model, epoch+1)
     
         scheduler.step()
-
-    if rank == 0:
+ 
+    if rank == 0: 
         writer.close()
 
     dist.destroy_process_group()
@@ -246,3 +258,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
