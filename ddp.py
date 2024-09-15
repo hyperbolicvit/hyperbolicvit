@@ -148,7 +148,7 @@ def train_ddp(rank, world_size):
     output_dir = './output'
 
     # Model setup
-    model = Net(num_classes=10).to(device)  # ImageNet has 1000 classes
+    model = Net(num_classes=1000).to(device)  # ImageNet has 1000 classes
     model = DDP(model, device_ids=[rank])
 
     # Data augmentation and normalization for ImageNet
