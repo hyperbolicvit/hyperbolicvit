@@ -36,8 +36,82 @@ def save_model(output_dir, model, epoch):
     torch.save(model_to_save.state_dict(), model_checkpoint)
     logger.info(f"Model checkpoint saved at {model_checkpoint}")
 
-# AverageMeter to track losses and accuracy
-class AverageMeter(object):
+# Function to calculate accuracy
+def simple_accuracy(preds, labels):
+    return (preds == labels).mean() * 100
+
+import torch
+
+def top_5_accuracy(output, target):
+    """
+    Compute the top-5 accuracy for classification tasks using model outputs.
+
+    Parameters:
+    output (torch.Tensor or numpy.ndarray): Raw model outputs (logits) of shape (n_samples, n_classes).
+    target (torch.Tensor or numpy.ndarray): True labels of shape (n_samples,).
+
+    Returns:
+    float: Top-5 accuracy score as a percentage.
+    """
+    # Convert output and target to tensors if they are not already
+    if isinstance(output, torch.Tensor):
+        logits = output.detach()
+    else:
+        logits = torch.tensor(output)
+
+    if isinstance(target, torch.Tensor):
+        targets = target.detach()
+    else:
+        targets = torch.tensor(target)
+
+    # Ensure logits are floating-point tensors
+    if not logits.is_floating_point():
+        logits = logits.float()
+
+    # Ensure targets are of type Long for comparison
+    if targets.dtype != torch.long:
+        targets = targets.long()
+
+
+    with torch.no_grad():
+        # Handle 1D output (e.g., batch size of 1)
+        if logits.dim() == 1:
+            logits = logits.unsqueeze(0)  # Shape: [1, n_classes]
+            targets = targets.unsqueeze(0)  # Shape: [1]
+
+        # Ensure logits have two dimensions: [batch_size, n_classes]
+        if logits.dim() != 2:
+            raise ValueError(f"Expected logits to be 2D, but got {logits.dim()}D")
+
+        # **Removed Softmax:** Not needed for top-k accuracy
+        # logits = torch.nn.functional.softmax(logits, dim=1)
+
+        # Get the indices of the top 5 predictions for each sample
+        # torch.topk returns a tuple (values, indices); we take indices
+        top5_preds = torch.topk(logits, k=5, dim=1).indices  # Shape: [batch_size, 5]
+
+        # Expand targets to compare with top5_preds
+        # targets.view(-1, 1) reshapes targets to [batch_size, 1]
+        # This allows broadcasting when comparing with top5_preds
+        targets_expanded = targets.view(-1, 1)  # Shape: [batch_size, 1]
+
+        # Check if the true label is among the top 5 predictions
+        correct = top5_preds.eq(targets_expanded)  # Shape: [batch_size, 5]
+
+
+        # For each sample, check if any of the top 5 predictions is correct
+        correct_any = correct.any(dim=1).float()  # Shape: [batch_size]
+
+        # Compute the top-5 accuracy as the mean of correct predictions
+        top5_accuracy = correct_any.mean().item() * 100.0
+
+        return top5_accuracy
+
+    
+class AverageMeter:
+    """
+    Computes and stores the average and current value.
+    """
     def __init__(self):
         self.reset()
 
@@ -52,39 +126,6 @@ class AverageMeter(object):
         self.sum += val * n
         self.count += n
         self.avg = self.sum / self.count
-
-# Function to calculate accuracy
-def simple_accuracy(preds, labels):
-    return (preds == labels).mean() * 100
-
-import numpy as np
-
-def top_5_accuracy(logits, targets):
-    """
-    Compute the top-5 accuracy for classification tasks using logits.
-
-    Parameters:
-    logits (numpy.ndarray): Array of shape (n_samples, n_classes) containing the logits (raw model outputs).
-    targets (numpy.ndarray): Array of shape (n_samples,) containing the true labels (as integer indices).
-
-    Returns:
-    float: Top-5 accuracy score as a percentage.
-    """
-    # Ensure logits is a 2D array
-    if logits.ndim == 1:
-        logits = logits.reshape(-1, 1)
-
-    # Get the indices of the top 5 logits for each sample
-    top5_preds = np.argsort(logits, axis=1)[:, -5:]
-    
-    # Check if the true label is in the top 5 predictions for each sample
-    top5_correct = np.any(top5_preds == targets.reshape(-1, 1), axis=1)
-    
-    # Compute the top-5 accuracy
-    top5_accuracy = np.mean(top5_correct) * 100
-    
-    return top5_accuracy
-
 
 # Geodesic regularization function
 def geodesic_regularization(outputs, labels, manifold, lambda_reg=0.01):
@@ -108,9 +149,8 @@ def geodesic_regularization(outputs, labels, manifold, lambda_reg=0.01):
 
 # Validation function
 def validate(model, val_loader, device):
-    eval_losses = AverageMeter()
     criterion = nn.CrossEntropyLoss()
-
+    eval_losses = AverageMeter()
     logger.info("***** Running Validation *****")
     model.eval()
     all_preds, all_labels = [], []
@@ -144,7 +184,7 @@ def train_ddp(rank, world_size):
     # Set hyperparameters
     batch_size = 32
     num_epochs = 350       
-    learning_rate = 0.01 / world_size 
+    learning_rate = 0.001 / world_size 
     output_dir = './output'
 
     # Model setup
@@ -163,11 +203,11 @@ def train_ddp(rank, world_size):
         transforms.ToTensor()
     ])
 
-    train_dataset = datasets.ImageNet(root='/data/jacob/ImageNet/', split='train', transform=transform)
-    val_dataset = datasets.ImageNet(root='/data/jacob/ImageNet/', split='val', transform=transform)
+    # train_dataset = datasets.ImageNet(root='/data/jacob/ImageNet/', split='train', transform=transform)
+    # val_dataset = datasets.ImageNet(root='/data/jacob/ImageNet/', split='val', transform=transform)
 
-    # train_dataset = datasets.CIFAR10(root='/data/jacob/cifar10/', train=True, download=True, transform=transform_cifar)
-    # val_dataset = datasets.CIFAR10(root='/data/jacob/cifar10/', train=False, download=True, transform=transform_cifar)
+    train_dataset = datasets.CIFAR10(root='/data/jacob/cifar10/', train=True, download=True, transform=transform_cifar)
+    val_dataset = datasets.CIFAR10(root='/data/jacob/cifar10/', train=False, download=True, transform=transform_cifar)
     
     # Sampler and DataLoader
     train_sampler = DistributedSampler(train_dataset)
@@ -179,7 +219,7 @@ def train_ddp(rank, world_size):
     # Loss, optimizer, and scheduler
     criterion = nn.CrossEntropyLoss()
     optimizer = RiemannianAdam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=80, gamma=0.1)  # Step LR, decay at epoch 30, 60
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=80, gamma=0.1)
 
     # Mixed Precision Scaler
     scaler = GradScaler()
