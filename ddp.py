@@ -13,7 +13,7 @@ from torchvision import datasets, transforms
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 from model import Net
-from torch.cuda.amp import GradScaler
+from torch.cuda.amp import GradScaler, autocast
 from geoopt.optim import RiemannianAdam
 import torch.nn.utils
     
@@ -188,19 +188,25 @@ def train_ddp(rank, world_size):
     output_dir = './output'
 
     # Model setup
-    model = Net(num_classes=1000).to(device)  # ImageNet has 1000 classes
+    model = Net(num_classes=10).to(device)  # ImageNet has 1000 classes
     model = DDP(model, device_ids=[rank])
 
     # Data augmentation and normalization for ImageNet
     transform = transforms.Compose([
         transforms.Resize(256),
         transforms.CenterCrop(224),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomCrop(224, padding=4),
+        transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
     
     transform_cifar = transforms.Compose([
-        transforms.ToTensor()
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomCrop(32, padding=4),
+        transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
+        transforms.ToTensor(), 
     ])
 
     train_dataset = datasets.ImageNet(root='/data/jacob/ImageNet/', split='train', transform=transform)
@@ -246,13 +252,13 @@ def train_ddp(rank, world_size):
             inputs, labels = inputs.to(device), labels.to(device)
 
             optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, labels)
-
-            # Geodesic regularization term
-            reg_loss = geodesic_regularization(outputs, labels, model.module.manifold, lambda_reg=lambda_reg)
-            total_loss = loss + reg_loss
-
+            
+            with autocast():
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
+                reg_loss = model.module.geodesic_regularization(outputs, labels, lambda_reg)
+                total_loss = loss + reg_loss
+                
             # Backward pass with gradient scaling for mixed precision
             scaler.scale(total_loss).backward()
 
