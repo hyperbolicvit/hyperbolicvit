@@ -184,7 +184,7 @@ def train_ddp(rank, world_size):
     # Set hyperparameters
     batch_size = 32
     num_epochs = 350       
-    learning_rate = 0.001 / world_size 
+    learning_rate = 0.01 / world_size 
     output_dir = './output'
 
     # Model setup
@@ -203,11 +203,11 @@ def train_ddp(rank, world_size):
         transforms.ToTensor()
     ])
 
-    # train_dataset = datasets.ImageNet(root='/data/jacob/ImageNet/', split='train', transform=transform)
-    # val_dataset = datasets.ImageNet(root='/data/jacob/ImageNet/', split='val', transform=transform)
+    train_dataset = datasets.ImageNet(root='/data/jacob/ImageNet/', split='train', transform=transform)
+    val_dataset = datasets.ImageNet(root='/data/jacob/ImageNet/', split='val', transform=transform)
 
-    train_dataset = datasets.CIFAR10(root='/data/jacob/cifar10/', train=True, download=True, transform=transform_cifar)
-    val_dataset = datasets.CIFAR10(root='/data/jacob/cifar10/', train=False, download=True, transform=transform_cifar)
+    # train_dataset = datasets.CIFAR10(root='/data/jacob/cifar10/', train=True, download=True, transform=transform_cifar)
+    # val_dataset = datasets.CIFAR10(root='/data/jacob/cifar10/', train=False, download=True, transform=transform_cifar)
     
     # Sampler and DataLoader
     train_sampler = DistributedSampler(train_dataset)
@@ -280,7 +280,7 @@ def train_ddp(rank, world_size):
             file.flush()
         
         # Save checkpoint every 5 epochs
-        if (epoch + 1) % 5 == 0:
+        if (epoch) % 3 == 0:
             save_model(output_dir, model, epoch+1)
     
         scheduler.step()
