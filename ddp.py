@@ -202,18 +202,29 @@ def train_ddp(rank, world_size):
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
     
+    transform_test = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    
     transform_cifar = transforms.Compose([
         transforms.RandomHorizontalFlip(),
         transforms.RandomCrop(32, padding=4),
         transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
         transforms.ToTensor(), 
     ])
+    
+    transform_cifar_test = transforms.Compose([
+        transforms.ToTensor(),
+    ])
 
     train_dataset = datasets.ImageNet(root='/data/jacob/ImageNet/', split='train', transform=transform)
-    val_dataset = datasets.ImageNet(root='/data/jacob/ImageNet/', split='val', transform=transform)
+    val_dataset = datasets.ImageNet(root='/data/jacob/ImageNet/', split='val', transform=transform_test)
 
     # train_dataset = datasets.CIFAR10(root='/data/jacob/cifar10/', train=True, download=True, transform=transform_cifar)
-    # val_dataset = datasets.CIFAR10(root='/data/jacob/cifar10/', train=False, download=True, transform=transform_cifar)
+    # val_dataset = datasets.CIFAR10(root='/data/jacob/cifar10/', train=False, download=True, transform=transform_cifar_test)
     
     # Sampler and DataLoader
     train_sampler = DistributedSampler(train_dataset)
@@ -235,25 +246,13 @@ def train_ddp(rank, world_size):
 
     # Regularization weight for geodesic loss
     lambda_reg = 0.001
-
-    # make the log file if it doesn't exist
-    log_file = os.path.join(output_dir, 'log.txt')
-    if not os.path.exists(log_file):
-        with open(log_file, 'w') as f:
-            f.write('')
-    # remove the log file if it exists
-    if os.path.exists(log_file):
-        os.remove(log_file)
-    # set up logging
-            
-    logging.basicConfig(filename=log_file, level=logging.INFO)
     
     # TensorBoard writer (only for rank 0 process)
     if rank == 0:
         writer = SummaryWriter(log_dir=os.path.join(output_dir, 'logs'))
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
-
+            
     # Training loop
     for epoch in range(num_epochs):
         model.train()
@@ -302,10 +301,6 @@ def train_ddp(rank, world_size):
             writer.add_scalar('Accuracy/val', accuracy, epoch+1)
             writer.add_scalar('Top5Accuracy/val', accuracy5, epoch+1)
             logger.info(f"Epoch {epoch+1}, Loss: {epoch_loss}, Accuracy: {accuracy:.4f}, Top5: {accuracy5:.4f}")
-            # output to log file
-            f.write(f"Epoch {epoch+1}, Loss: {epoch_loss}, Accuracy: {accuracy:.4f}, Top5: {accuracy5:.4f}\n")
-
-            # Save checkpoint
             save_model(output_dir, model, epoch+1)
 
         # Step the scheduler
