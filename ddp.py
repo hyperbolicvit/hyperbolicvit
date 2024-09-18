@@ -268,9 +268,9 @@ def train_ddp(rank, world_size):
                 outputs = model(inputs)
                 loss = criterion(outputs, labels)
                 # If using geodesic regularization:
-                # reg_loss = model.module.geodesic_regularization(outputs, labels, lambda_reg)
-                # total_loss = loss + reg_loss
-                total_loss = loss
+                reg_loss = model.module.geodesic_regularization(outputs, labels, lambda_reg)
+                total_loss = loss + reg_loss
+                # total_loss = loss
 
             # Backward pass with gradient scaling for mixed precision
             scaler.scale(total_loss).backward()
