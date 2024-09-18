@@ -16,7 +16,9 @@ from model import Net
 from torch.cuda.amp import GradScaler, autocast
 from geoopt.optim import RiemannianAdam
 import torch.nn.utils
-    
+import gc
+
+gc.collect()
 # Set up logger
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -39,8 +41,6 @@ def save_model(output_dir, model, epoch):
 # Function to calculate accuracy
 def simple_accuracy(preds, labels):
     return (preds == labels).mean() * 100
-
-import torch
 
 def top_5_accuracy(output, target):
     """
@@ -178,18 +178,18 @@ def train_ddp(rank, world_size):
     dist.init_process_group(backend='nccl', init_method='env://', world_size=world_size, rank=rank)
     torch.cuda.set_device(rank)
     device = torch.device(f'cuda:{rank}')
-
+    torch.cuda.empty_cache()
     set_seed(42)  # Set a fixed seed for reproducibility
 
     # Set hyperparameters
     batch_size = 32
     num_epochs = 350       
-    learning_rate = 0.01 / world_size 
+    learning_rate = 5e-3 / world_size 
     output_dir = './output'
 
     # Model setup
     model = Net(num_classes=1000).to(device)  # ImageNet has 1000 classes
-    model = DDP(model, device_ids=[rank])
+    model = DDP(model, device_ids=[rank], find_unused_parameters=True)  # Use DDP for distributed training
 
     # Data augmentation and normalization for ImageNet
     transform = transforms.Compose([
@@ -219,13 +219,13 @@ def train_ddp(rank, world_size):
     train_sampler = DistributedSampler(train_dataset)
     val_sampler = DistributedSampler(val_dataset, shuffle=False)
     
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=train_sampler, num_workers=8, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, sampler=val_sampler, num_workers=8, pin_memory=True)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=train_sampler)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, sampler=val_sampler)
 
     # Loss, optimizer, and scheduler
     criterion = nn.CrossEntropyLoss()
-    optimizer = RiemannianAdam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=80, gamma=0.1)
+    optimizer = RiemannianAdam(model.parameters(), lr=learning_rate)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.1)
 
     # Mixed Precision Scaler
     scaler = GradScaler()
@@ -234,31 +234,45 @@ def train_ddp(rank, world_size):
     clip_value = 1.0  # Clip gradients to this value
 
     # Regularization weight for geodesic loss
-    lambda_reg = 0.01  # Weight for the geodesic regularization
+    lambda_reg = 0.001
 
+    # make the log file if it doesn't exist
+    log_file = os.path.join(output_dir, 'log.txt')
+    if not os.path.exists(log_file):
+        with open(log_file, 'w') as f:
+            f.write('')
+    # remove the log file if it exists
+    if os.path.exists(log_file):
+        os.remove(log_file)
+    # set up logging
+            
+    logging.basicConfig(filename=log_file, level=logging.INFO)
+    
     # TensorBoard writer (only for rank 0 process)
     if rank == 0:
         writer = SummaryWriter(log_dir=os.path.join(output_dir, 'logs'))
-    
-    file = open("log.txt", "w")
-    
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+
     # Training loop
     for epoch in range(num_epochs):
         model.train()
         train_sampler.set_epoch(epoch)
         running_loss = 0.0
 
-        for i, (inputs, labels) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")):
-            inputs, labels = inputs.to(device), labels.to(device)
+        for inputs, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} on Rank {rank}"):
+            inputs, labels = inputs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
 
             optimizer.zero_grad()
-            
+
             with autocast():
                 outputs = model(inputs)
                 loss = criterion(outputs, labels)
-                reg_loss = model.module.geodesic_regularization(outputs, labels, lambda_reg)
-                total_loss = loss + reg_loss
-                
+                # If using geodesic regularization:
+                # reg_loss = model.module.geodesic_regularization(outputs, labels, lambda_reg)
+                # total_loss = loss + reg_loss
+                total_loss = loss
+
             # Backward pass with gradient scaling for mixed precision
             scaler.scale(total_loss).backward()
 
@@ -266,32 +280,38 @@ def train_ddp(rank, world_size):
             scaler.unscale_(optimizer)  # Unscales gradients to prevent issues when clipping
             torch.nn.utils.clip_grad_norm_(model.parameters(), clip_value)
 
-            # Update weights
+            # Step the optimizer first, then the scheduler
+            optimizer.step()
             scaler.step(optimizer)
             scaler.update()
+            scheduler.step()  # Moved after optimizer step
 
             running_loss += total_loss.item()
 
-        logger.info(f"Epoch {epoch+1}, Loss: {running_loss / len(train_loader)}")
+            # Clear cache to reduce memory fragmentation
+            torch.cuda.empty_cache()
 
-        # Validation
-        accuracy, accuracy5 = validate(model, val_loader, device)
+        # Log training loss
+        epoch_loss = running_loss / len(train_loader)
+        logger.info(f"Epoch {epoch+1}, Rank {rank}, Loss: {epoch_loss}")
 
-        # TensorBoard writer
+        # Validation (only on rank 0 to save resources)
         if rank == 0:
-            writer.add_scalar('Loss/train', running_loss / len(train_loader), epoch+1)
+            accuracy, accuracy5 = validate(model.module, val_loader, device)  # Use model.module for DDP
+            writer.add_scalar('Loss/train', epoch_loss, epoch+1)
             writer.add_scalar('Accuracy/val', accuracy, epoch+1)
-            logger.info(f"Epoch {epoch+1}, Loss: {running_loss / len(train_loader)}, Accuracy: {accuracy:.4f}, Top5: {accuracy5:.4f}")
-            file.write(f"Epoch {epoch+1}, Loss: {running_loss / len(train_loader)}, Accuracy: {accuracy:.4f}, Top5: {accuracy5:.4f}\n")
-            file.flush()
-        
-        # Save checkpoint every 5 epochs
-        if (epoch) % 3 == 0:
+            writer.add_scalar('Top5Accuracy/val', accuracy5, epoch+1)
+            logger.info(f"Epoch {epoch+1}, Loss: {epoch_loss}, Accuracy: {accuracy:.4f}, Top5: {accuracy5:.4f}")
+            # output to log file
+            f.write(f"Epoch {epoch+1}, Loss: {epoch_loss}, Accuracy: {accuracy:.4f}, Top5: {accuracy5:.4f}\n")
+
+            # Save checkpoint
             save_model(output_dir, model, epoch+1)
-    
+
+        # Step the scheduler
         scheduler.step()
- 
-    if rank == 0: 
+
+    if rank == 0:
         writer.close()
 
     dist.destroy_process_group()
@@ -304,4 +324,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
