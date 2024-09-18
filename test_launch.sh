@@ -18,7 +18,7 @@ function launchrun() {
 # Example usage of the launchrun function
 gpus="0,1,2,3,4,5,6,7"  # Specify which GPUs to use (e.g., GPU 0, 1, 2, 3)
 logfile="test_log.txt"  # Specify the log file
-trainfile="test_ddp.py"  # The training script
+trainfile="test.py"  # The training script
 
 # Set the number of processes for distributed training (equal to the number of GPUs)
 num_processes=8
