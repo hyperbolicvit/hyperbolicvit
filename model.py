@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import geoopt
 from geoopt import ManifoldParameter
-
+import math
 
 class HyperbolicLinear(nn.Module):
     def __init__(self, in_features, out_features, manifold, bias=True):
@@ -30,6 +30,27 @@ class HyperbolicLinear(nn.Module):
         return output
 
 
+class HyperbolicLayerNorm(nn.Module):
+    """
+    Hyperbolic Layer Normalization as defined in Equation (18):
+    LayerNorm^D(x) = exp_0(LayerNorm(log_0(x)))
+    """
+    def __init__(self, normalized_shape, manifold):
+        super(HyperbolicLayerNorm, self).__init__()
+        self.manifold = manifold
+        self.normalized_shape = normalized_shape
+        self.layer_norm = nn.LayerNorm(normalized_shape)
+
+    def forward(self, x):
+        # Map to tangent space at origin
+        x_tangent = self.manifold.logmap0(x)
+        # Apply Euclidean LayerNorm
+        x_norm = self.layer_norm(x_tangent)
+        # Map back to manifold
+        x_hyperbolic = self.manifold.expmap0(x_norm)
+        return x_hyperbolic
+
+
 class HyperbolicMultiheadAttention(nn.Module):
     def __init__(self, embedding_dim, num_heads, manifold):
         super(HyperbolicMultiheadAttention, self).__init__()
@@ -48,8 +69,12 @@ class HyperbolicMultiheadAttention(nn.Module):
 
         self.out_proj = HyperbolicLinear(embedding_dim, embedding_dim, manifold)
 
-        # Initialize head_scaling as a learnable parameter
+        # Initialize head_scaling as a learnable parameter (alpha_h in methods)
         self.head_scaling = nn.Parameter(torch.ones(num_heads, 1, 1))
+
+        # Small constants for numerical stability
+        self.epsilon = 1e-15  # For denominator
+        self.delta = 1e-7     # For clamping acosh argument
 
     def forward(self, x):
         batch_size, seq_length, embed_dim = x.size()
@@ -65,13 +90,13 @@ class HyperbolicMultiheadAttention(nn.Module):
         v = v.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
 
         # Compute the attention scores using hyperbolic distance
-        attn_scores = self._hyperbolic_attention_scores(q, k) / (self.head_scaling * (self.head_dim ** 0.5))
+        attn_scores = self._hyperbolic_attention_scores(q, k) / (self.head_scaling * math.sqrt(self.head_dim))
 
         # Apply softmax to get attention weights
         attn_weights = F.softmax(attn_scores, dim=-1)
 
-        # Compute attention output
-        attn_output = torch.matmul(attn_weights, v)
+        # Compute attention output using the updated _mobius_matmul method
+        attn_output = self._mobius_matmul(attn_weights, v)  # Using Möbius operations
 
         # Reshape and project the output
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_length, embed_dim)
@@ -79,30 +104,74 @@ class HyperbolicMultiheadAttention(nn.Module):
 
         return output
 
+    # Include the updated _hyperbolic_attention_scores method here from the previous fix
     def _hyperbolic_attention_scores(self, q, k):
-        # Efficiently compute pairwise hyperbolic distances for attention scores
-        # q, k: (batch_size, num_heads, seq_length, head_dim)
+        # Compute hyperbolic distances as per Equations (23)-(26)
+        c = self.manifold.c
+        c = c.type_as(q.data)
         batch_size, num_heads, seq_length, head_dim = q.size()
 
-        # Normalize q and k to have norms less than 1 (ensure they are in Poincare ball)
-        q = q.clamp_max(1 - 1e-5)
-        k = k.clamp_max(1 - 1e-5)
+        # Ensure q and k have norms less than 1/sqrt(c)
+        max_norm = (1 - 1e-5) / c.sqrt()
+        q = q.clamp_max(max_norm)
+        k = k.clamp_max(max_norm)
 
-        # Compute pairwise distance matrix using Poincare distance formula
-        # Efficient computation using batch operations
-        q_norm_sq = torch.sum(q * q, dim=-1, keepdim=True)
-        k_norm_sq = torch.sum(k * k, dim=-1, keepdim=True)
+        # Compute norms squared and reshape for broadcasting
+        q_norm_sq = c * torch.sum(q * q, dim=-1, keepdim=True)  # Shape: (B, H, S, 1)
+        k_norm_sq = c * torch.sum(k * k, dim=-1, keepdim=True)  # Shape: (B, H, S, 1)
 
-        # Compute cross term q · k^T (batch matrix multiplication)
-        qk_inner = torch.matmul(q, k.transpose(-2, -1))  # Shape: (B, H, S, S)
+        # Expand dimensions for pairwise operations
+        q_norm_sq_expanded = q_norm_sq.expand(-1, -1, -1, seq_length)  # Shape: (B, H, S, S)
+        k_norm_sq_expanded = k_norm_sq.transpose(2, 3).expand(-1, -1, seq_length, -1)  # Shape: (B, H, S, S)
 
-        # Compute the distances using the hyperbolic law of cosines
-        numerator = 2 * (q_norm_sq + k_norm_sq.transpose(-2, -1) - 2 * qk_inner)
-        denominator = (1 - q_norm_sq) * (1 - k_norm_sq).transpose(-2, -1) + 1e-15
+        # Compute Möbius subtraction q ⊕ (-k)
+        # Expand q and k for pairwise operations
+        q_expanded = q.unsqueeze(3)  # Shape: (B, H, S, 1, D)
+        k_expanded = k.unsqueeze(2)  # Shape: (B, H, 1, S, D)
+        neg_k_expanded = -k_expanded  # Shape: (B, H, 1, S, D)
 
-        dist_sq = torch.acosh(1 + numerator / denominator).clamp(min=1e-7)
-        attn_scores = -dist_sq.squeeze(-1)  # Shape: (B, H, S, S)
+        # Compute pairwise Möbius addition
+        diff = self.manifold.mobius_add(neg_k_expanded, q_expanded)  # Shape: (B, H, S, S, D)
+
+        # Compute norm squared of the difference
+        diff_norm_sq = c * torch.sum(diff * diff, dim=-1)  # Shape: (B, H, S, S)
+
+        # Compute denominator (1 - c * ||q||^2)(1 - c * ||k||^2) + epsilon
+        denominator = (1 - q_norm_sq_expanded) * (1 - k_norm_sq_expanded) + self.epsilon  # Shape: (B, H, S, S)
+
+        # Compute the argument of acosh, ensure it's >= 1 + delta
+        acosh_arg = 1 + (2 * diff_norm_sq) / denominator  # Shape: (B, H, S, S)
+        acosh_arg = acosh_arg.clamp_min(1 + self.delta)
+
+        # Compute hyperbolic distances
+        dist = torch.log(acosh_arg + torch.sqrt(acosh_arg * acosh_arg - 1))  # Shape: (B, H, S, S)
+
+        # Negative distances as attention scores
+        attn_scores = -dist  # Shape: (B, H, S, S)
         return attn_scores
+    
+    
+    def _mobius_matmul(self, attn_weights, v):
+        """
+        Perform Möbius matrix multiplication (weighted sum) for attention.
+
+        Args:
+            attn_weights (torch.Tensor): Attention weights of shape (B, H, S_q, S_k).
+            v (torch.Tensor): Value vectors of shape (B, H, S_k, D).
+
+        Returns:
+            torch.Tensor: The attention output of shape (B, H, S_q, D).
+        """
+        # Map v to the tangent space at the origin
+        v_tangent = self.manifold.logmap0(v)  # Shape: (B, H, S_k, D)
+
+        # Perform the weighted sum in the tangent space
+        attn_output_tangent = torch.matmul(attn_weights, v_tangent)  # Shape: (B, H, S_q, D)
+
+        # Map the result back to the manifold
+        attn_output = self.manifold.expmap0(attn_output_tangent)  # Shape: (B, H, S_q, D)
+
+        return attn_output
 
 
 class HyperbolicTransformerLayer(nn.Module):
@@ -115,24 +184,35 @@ class HyperbolicTransformerLayer(nn.Module):
         self.linear2 = HyperbolicLinear(embedding_dim * 4, embedding_dim, manifold)
         self.dropout = nn.Dropout(dropout)
         self.layer_scaling = nn.Parameter(torch.ones(1))
+        self.beta = nn.Parameter(torch.ones(1))  # For residual scaling
+
+        # Hyperbolic Layer Norm layers
+        self.hyperbolic_layer_norm1 = HyperbolicLayerNorm(embedding_dim, manifold)
+        self.hyperbolic_layer_norm2 = HyperbolicLayerNorm(embedding_dim, manifold)
 
     def forward(self, x):
         # Self-attention
         attn_output = self.self_attn(x)
-        x = self.manifold.mobius_add(x, self.dropout(attn_output) * self.layer_scaling)
+        residual = self.manifold.mobius_scalar_mul(self.beta, attn_output)
+        x = self.manifold.mobius_add(x, self.dropout(residual))
+        # Hyperbolic Layer Norm
+        x = self.hyperbolic_layer_norm1(x)
 
         # Feedforward network with Möbius ReLU
         x2 = self.linear1(x)
         x2 = self.mobius_relu(x2)
         x2 = self.linear2(x2)
-        x = self.manifold.mobius_add(x, self.dropout(x2) * self.layer_scaling)
+        residual = self.manifold.mobius_scalar_mul(self.beta, x2)
+        x = self.manifold.mobius_add(x, self.dropout(residual))
+        # Hyperbolic Layer Norm
+        x = self.hyperbolic_layer_norm2(x)
 
         return x
 
     def mobius_relu(self, x):
         x_euclidean = self.manifold.logmap0(x)
-        # Use in-place ReLU for efficiency
-        x_euclidean.relu_()
+        # Apply ReLU in Euclidean space
+        x_euclidean = F.relu(x_euclidean)
         return self.manifold.expmap0(x_euclidean)
 
 
@@ -186,7 +266,8 @@ class HyperbolicConv2d(nn.Module):
         )
 
         if self.bias is not None:
-            output_euclidean += self.bias.view(1, -1, 1, 1)
+            bias_euclidean = self.manifold.logmap0(self.bias).view(1, -1, 1, 1)
+            output_euclidean += bias_euclidean
 
         # Map the output back to hyperbolic space
         output_hyperbolic = self.manifold.expmap0(output_euclidean)
@@ -200,11 +281,11 @@ class HyperbolicLearnedPositionEncoding(nn.Module):
         position_embeddings = torch.zeros(1, num_patches, embedding_dim)
         nn.init.xavier_uniform_(position_embeddings)
         self.position_embeddings = ManifoldParameter(position_embeddings, manifold=manifold)
-        self.curvature = nn.Parameter(torch.tensor(1.0))  # Learnable curvature
+        self.curvature = nn.Parameter(torch.tensor(1.0))  # Learnable curvature (c in the methods)
 
     def forward(self, x):
-        # Efficient element-wise multiplication with broadcasting
-        scaled_embeddings = self.position_embeddings * self.curvature
+        # Scaled positional embeddings: E_pos = c ⊗ E_pos^0
+        scaled_embeddings = self.manifold.mobius_scalar_mul(self.curvature, self.position_embeddings)
         return self.manifold.mobius_add(x, scaled_embeddings)
 
 
@@ -215,20 +296,11 @@ class Net(nn.Module):
         patch_size=16,
         in_channels=3,
         num_classes=1000,
-        embedding_dim=128,
+        embedding_dim=512,
         num_heads=8,
         num_layers=8,
         dropout=0.1,
         manifold=None,
-        # img_size=32,
-        # patch_size=4,
-        # in_channels=3,
-        # num_classes=10,
-        # embedding_dim=128,
-        # num_heads=8,
-        # num_layers=8,
-        # dropout=0.1,
-        # manifold=None
     ):
         super(Net, self).__init__()
         if manifold is None:
@@ -242,7 +314,7 @@ class Net(nn.Module):
             embedding_dim,
             kernel_size=patch_size,
             stride=patch_size,
-            c=1.0,
+            c=manifold.c.item(),
         )
 
         self.hyperbolic_embedding = HyperbolicLearnedPositionEncoding(
@@ -257,6 +329,7 @@ class Net(nn.Module):
         )
 
         self.dropout = nn.Dropout(dropout)
+        # Output layer: mapping from hyperbolic to Euclidean space
         self.fc = nn.Linear(embedding_dim, num_classes)
 
     def forward(self, x):
@@ -278,7 +351,8 @@ class Net(nn.Module):
         return x
 
     def geodesic_regularization(self, outputs, labels, lambda_reg=0.01):
-        # Compute pairwise geodesic distances efficiently
+        # Compute geodesic distances as per Equation (35)
+        batch_size = outputs.size(0)
         outputs = outputs / outputs.norm(dim=1, keepdim=True).clamp_min(1e-7)
         dist_matrix = self.manifold.dist(outputs.unsqueeze(1), outputs.unsqueeze(0))  # Shape: (B, B)
         label_matrix = (labels.unsqueeze(1) == labels.unsqueeze(0)).float()  # Shape: (B, B)
