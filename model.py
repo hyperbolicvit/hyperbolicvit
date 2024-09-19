@@ -156,7 +156,6 @@ class HyperbolicMultiheadAttention(nn.Module):
 
         return output
 
-
 # Hyperbolic Transformer Layer with Enhancements
 class HyperbolicTransformerLayer(nn.Module):
     def __init__(self, embedding_dim, num_heads, dropout, manifold):
