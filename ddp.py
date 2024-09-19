@@ -189,7 +189,7 @@ def train_ddp(rank, world_size):
 
     # Model setup
     model = Net(num_classes=1000).to(device)  # ImageNet has 1000 classes
-    model = DDP(model, device_ids=[rank], find_unused_parameters=True)  # Use DDP for distributed training
+    model = DDP(model, device_ids=[rank])  # Use DDP for distributed training
 
     # Data augmentation and normalization for ImageNet
     transform = transforms.Compose([
