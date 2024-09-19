@@ -20,10 +20,10 @@ class HyperbolicLayerNorm(nn.Module):
         x_tangent = self.manifold.logmap0(x)
         # Apply LayerNorm over the last dimension (embedding_dim)
         x_norm = F.layer_norm(
-            x_tangent, 
-            self.normalized_shape, 
-            self.gamma, 
-            self.beta, 
+            x_tangent,
+            self.normalized_shape,
+            self.gamma,
+            self.beta,
             self.eps
         )
         # Map back to manifold
@@ -101,8 +101,45 @@ class HyperbolicLearnedPositionEncoding(nn.Module):
         self.curvature = nn.Parameter(torch.tensor(1.0))  # Learnable curvature
 
     def forward(self, x):
-        scaled_embeddings = self.position_embeddings.mul(self.curvature)
+        scaled_embeddings = self.position_embeddings * self.curvature
         return self.manifold.mobius_add(x, scaled_embeddings)
+
+# Hyperbolic Patch Embedding without nn.Conv2d
+class HyperbolicPatchEmbedding(nn.Module):
+    def __init__(self, img_size, patch_size, in_channels, embedding_dim, manifold):
+        super(HyperbolicPatchEmbedding, self).__init__()
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.in_channels = in_channels
+        self.embedding_dim = embedding_dim
+        self.num_patches = (img_size // patch_size) ** 2
+        self.manifold = manifold
+
+        # Calculate the flattened patch size
+        self.patch_dim = in_channels * patch_size * patch_size
+
+        # Linear layer to project patches into embedding space
+        self.proj = HyperbolicLinear(self.patch_dim, embedding_dim, manifold)
+
+    def forward(self, x):
+        batch_size = x.size(0)
+        # Unfold the image to extract patches
+        patches = x.unfold(2, self.patch_size, self.patch_size).unfold(3, self.patch_size, self.patch_size)
+        # patches shape: (batch_size, in_channels, num_patches_h, num_patches_w, patch_size, patch_size)
+        patches = patches.contiguous().view(
+            batch_size,
+            self.in_channels,
+            -1,
+            self.patch_size,
+            self.patch_size
+        )
+        patches = patches.permute(0, 2, 1, 3, 4)  # (batch_size, num_patches, in_channels, patch_size, patch_size)
+        patches = patches.contiguous().view(batch_size, self.num_patches, -1)  # (batch_size, num_patches, patch_dim)
+
+        # Project patches to hyperbolic embedding space
+        x = self.proj(patches)  # (batch_size, num_patches, embedding_dim)
+
+        return x
 
 # Hyperbolic Multihead Attention with DropConnect
 class HyperbolicMultiheadAttention(nn.Module):
@@ -132,25 +169,25 @@ class HyperbolicMultiheadAttention(nn.Module):
 
         q, k, v = [tensor.transpose(1, 2) for tensor in (q, k, v)]  # (batch_size, num_heads, seq_length, head_dim)
 
-        q_norm = q.norm(dim=-1, keepdim=True).pow(2)
-        k_norm = k.norm(dim=-1, keepdim=True).pow(2)
-        denom = (1 - self.curvature * q_norm).unsqueeze(-2) * (1 - self.curvature * k_norm).unsqueeze(-3) + 1e-15
+        # Compute hyperbolic distance-based attention scores
+        # Map to tangent space
+        q_tangent = self.manifold.logmap0(q)
+        k_tangent = self.manifold.logmap0(k)
 
-        diff = q.unsqueeze(-2) - k.unsqueeze(-3)
-        diff_norm_sq = diff.pow(2).sum(dim=-1)
+        # Compute dot product attention in tangent space
+        attn_scores = torch.matmul(q_tangent, k_tangent.transpose(-1, -2)) / math.sqrt(self.head_dim)
+        attn_scores = attn_scores / self.head_scaling
 
-        arccosh_arg = 1 + 2 * self.curvature * diff_norm_sq / denom.squeeze(-1)
-        arccosh_arg = arccosh_arg.clamp(min=1 + 1e-7)  # Stability
-
-        dist = torch.log(arccosh_arg + torch.sqrt(arccosh_arg.pow(2) - 1))
-        attn_scores = -dist.pow(2) / (self.head_scaling * (self.head_dim ** 0.5))
-
+        # Apply softmax to get attention weights
         attn_weights = F.softmax(attn_scores, dim=-1)
 
         if self.training and self.dropconnect_prob > 0:
             attn_weights = F.dropout(attn_weights, p=self.dropconnect_prob, training=True)
 
-        attn_output = torch.matmul(attn_weights, v)
+        # Compute attention output
+        attn_output_tangent = torch.matmul(attn_weights, self.manifold.logmap0(v))
+        attn_output = self.manifold.expmap0(attn_output_tangent)
+
         attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_length, embed_dim)
         output = self.out_proj(attn_output)
 
@@ -163,11 +200,11 @@ class HyperbolicTransformerLayer(nn.Module):
         self.manifold = manifold
 
         self.self_attn = HyperbolicMultiheadAttention(embedding_dim, num_heads, manifold)
-        self.norm1 = HyperbolicLayerNorm(embedding_dim, manifold)  # Corrected LayerNorm
-        self.norm2 = HyperbolicLayerNorm(embedding_dim, manifold)  # Corrected LayerNorm
+        self.norm1 = HyperbolicLayerNorm(embedding_dim, manifold)
+        self.norm2 = HyperbolicLayerNorm(embedding_dim, manifold)
         
         self.linear1 = HyperbolicLinear(embedding_dim, embedding_dim * 4, manifold)
-        self.activation = MobiusPReLU(manifold)  # Updated to use shared alpha
+        self.activation = MobiusPReLU(manifold)
         self.linear2 = HyperbolicLinear(embedding_dim * 4, embedding_dim, manifold)
         self.dropout = nn.Dropout(dropout)
         self.layer_scaling = nn.Parameter(torch.ones(1))
@@ -179,56 +216,33 @@ class HyperbolicTransformerLayer(nn.Module):
     
         # Feedforward network with Mobius PReLU and normalization
         x2 = self.linear1(x)
-        x2 = self.activation(x2)  # Activation now correctly handles shape
+        x2 = self.activation(x2)
         x2 = self.linear2(x2)
         x = self.norm2(self.manifold.mobius_add(x, self.dropout(x2).mul(self.layer_scaling)))
     
         return x
 
-# Final Enhanced Network
+# Final Enhanced Network with HyperbolicPatchEmbedding
 class Net(nn.Module):
-    # def __init__(self,
-    #              img_size=32,
-    #              patch_size=4,
-    #              in_channels=3,
-    #              num_classes=10,
-    #              embedding_dim=256,  # Increased from 128
-    #              num_heads=8,         # Increased from 4
-    #              num_layers=6,        # Increased from 4
-    #              dropout=0.1,
-    #              manifold=None):
-    # def __init__(self,
-    #                 img_size=224,
-    #                 patch_size=16,
-    #                 in_channels=3,
-    #                 num_classes=1000,
-    #                 embedding_dim=768,
-    #                 num_heads=12,
-    #                 num_layers=12,
-    #                 dropout=0.1,
-    #                 manifold=None):
-    
-    # def __init__(self,
-    #                 img_size=224,
-    #                 patch_size=16,
-    #                 in_channels=3,
-    #                 num_classes=1000,
-    #                 embedding_dim=1024,
-    #                 num_heads=16,
-    #                 num_layers=12,
-    #                 dropout=0.1,
-    #                 manifold=None):
-    
     def __init__(self,
                 img_size=224,
                 patch_size=16,
                 in_channels=3,
                 num_classes=1000,
-                embedding_dim=1280,
-                num_heads=20,
+                embedding_dim=768,
+                num_heads=12,
                 num_layers=12,
                 dropout=0.1,
                 manifold=None):
+                # img_size = 32,
+                # patch_size = 4,
+                # in_channels = 3,
+                # num_classes = 10,
+                # embedding_dim = 64,
+                # num_heads = 4,
+                # num_layers = 4,
+                # dropout = 0.1,
+                # manifold = None):
         super(Net, self).__init__()
         if manifold is None:
             self.manifold = geoopt.PoincareBall(c=1.0)  # Use fixed curvature
@@ -237,11 +251,13 @@ class Net(nn.Module):
 
         self.num_patches = (img_size // patch_size) ** 2
 
-        self.patch_embeddings = nn.Conv2d(
-            in_channels,
-            embedding_dim,
-            kernel_size=patch_size,
-            stride=patch_size,
+        # Replace nn.Conv2d with HyperbolicPatchEmbedding
+        self.patch_embeddings = HyperbolicPatchEmbedding(
+            img_size=img_size,
+            patch_size=patch_size,
+            in_channels=in_channels,
+            embedding_dim=embedding_dim,
+            manifold=self.manifold
         )
 
         self.hyperbolic_embedding = HyperbolicLearnedPositionEncoding(
@@ -253,13 +269,12 @@ class Net(nn.Module):
             for _ in range(num_layers)
         ])
 
-        self.norm = HyperbolicLayerNorm(embedding_dim, self.manifold)  # Corrected LayerNorm
+        self.norm = HyperbolicLayerNorm(embedding_dim, self.manifold)
         self.dropout = nn.Dropout(dropout)
         self.fc = HyperbolicLinear(embedding_dim, num_classes, self.manifold)
 
     def forward(self, x):
-        x = self.patch_embeddings(x)  # (batch_size, embedding_dim, num_patches_sqrt, num_patches_sqrt)
-        x = x.flatten(2).transpose(1, 2)  # (batch_size, num_patches, embedding_dim)
+        x = self.patch_embeddings(x)  # (batch_size, num_patches, embedding_dim)
 
         x = self.manifold.expmap0(x)
         x = self.hyperbolic_embedding(x)
@@ -278,7 +293,6 @@ class Net(nn.Module):
 
     def get_features(self, x):
         x = self.patch_embeddings(x)
-        x = x.flatten(2).transpose(1, 2)
         x = self.manifold.expmap0(x)
         x = self.hyperbolic_embedding(x)
         for layer in self.layers:
